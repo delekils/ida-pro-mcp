@@ -104,11 +104,17 @@ Unsafe functions (`--unsafe` flag required):
 
 ## Installation
 
-Install the latest version of the IDA Pro MCP package:
+Install the latest version of the IDA Pro MCP package from PyPI:
 
 ```sh
-pip uninstall ida-pro-mcp
-pip install https://github.com/mrexodia/ida-pro-mcp/archive/refs/heads/main.zip
+pip uninstall -y ida-pro-mcp
+pip install ida-pro-mcp
+```
+
+Alternatively, using uv:
+
+```sh
+uv pip install ida-pro-mcp
 ```
 
 Configure the MCP servers and install the IDA Plugin:
