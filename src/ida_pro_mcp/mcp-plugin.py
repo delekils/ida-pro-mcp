@@ -8,6 +8,8 @@ import json
 import struct
 import threading
 import http.server
+import io
+from contextlib import redirect_stdout, redirect_stderr
 from urllib.parse import urlparse
 from typing import (
     Any,
@@ -277,6 +279,11 @@ import ida_dbg
 import ida_name
 import ida_ida
 import ida_frame
+import ida_segment
+import ida_struct
+import ida_enum
+import ida_auto
+import ida_ua
 
 ida_major, ida_minor = map(int, idaapi.get_kernel_version().split("."))
 
@@ -475,6 +482,16 @@ class Function(TypedDict):
     address: str
     name: str
     size: str
+
+class SegmentInfo(TypedDict):
+    name: str
+    start: str
+    end: str
+    permissions: str
+    bitness: int
+    segment_class: NotRequired[str]
+    comment: NotRequired[str]
+    repeatable_comment: NotRequired[str]
 
 def parse_address(address: str | int) -> int:
     if isinstance(address, int):
@@ -1944,6 +1961,379 @@ def data_read_string(
         return idaapi.get_strlit_contents(parse_address(address),-1,0).decode("utf-8")
     except Exception as e:
         return "Error:" + str(e)
+
+SEGMENT_PERMISSION_FLAGS = {
+    "r": ida_segment.SEGPERM_READ,
+    "w": ida_segment.SEGPERM_WRITE,
+    "x": ida_segment.SEGPERM_EXEC,
+}
+
+def segment_perm_to_string(perm: int) -> str:
+    return ''.join([
+        'r' if perm & ida_segment.SEGPERM_READ else '-',
+        'w' if perm & ida_segment.SEGPERM_WRITE else '-',
+        'x' if perm & ida_segment.SEGPERM_EXEC else '-',
+    ])
+
+def parse_segment_permissions(permissions: str) -> int:
+    permissions = permissions.strip()
+    if not permissions:
+        raise IDAError("Permissions string is empty")
+    try:
+        return int(permissions, 0)
+    except ValueError:
+        pass
+
+    value = 0
+    for ch in permissions.lower():
+        if ch in SEGMENT_PERMISSION_FLAGS:
+            value |= SEGMENT_PERMISSION_FLAGS[ch]
+        elif ch in "- ":
+            continue
+        else:
+            raise IDAError(f"Invalid segment permission character: {ch}")
+    return value
+
+def require_segment(address: int) -> ida_segment.segment_t:
+    seg = ida_segment.getseg(address)
+    if not seg:
+        raise IDAError(f"No segment found at address {hex(address)}")
+    return seg
+
+@jsonrpc
+@idaread
+def list_segments() -> list[SegmentInfo]:
+    """List all segments in the database with metadata"""
+    segments: list[SegmentInfo] = []
+    for i in range(ida_segment.get_segm_qty()):
+        seg = ida_segment.getnseg(i)
+        if not seg:
+            continue
+
+        perm = ida_segment.get_segm_attr(seg, ida_segment.SEGATTR_PERM)
+        if perm is None or perm == -1:
+            perm = seg.perm if hasattr(seg, 'perm') else 0
+
+        bitness = ida_segment.get_segm_attr(seg, ida_segment.SEGATTR_BITNESS)
+        if bitness is None or bitness < 0:
+            bitness = getattr(seg, 'bitness', 1)
+
+        bitness_value = 16 << bitness if bitness in (0, 1, 2) else bitness
+
+        info: SegmentInfo = SegmentInfo(
+            name=ida_segment.get_segm_name(seg) or "",
+            start=hex(seg.start_ea),
+            end=hex(seg.end_ea),
+            permissions=segment_perm_to_string(perm),
+            bitness=bitness_value,
+        )
+
+        seg_class = ida_segment.get_segm_class(seg)
+        if seg_class:
+            info["segment_class"] = seg_class
+
+        comment = ida_segment.get_segment_cmt(seg, False)
+        if comment:
+            info["comment"] = comment
+        repeatable_comment = ida_segment.get_segment_cmt(seg, True)
+        if repeatable_comment:
+            info["repeatable_comment"] = repeatable_comment
+
+        segments.append(info)
+    return segments
+
+@jsonrpc
+@idawrite
+def set_segment_name(
+    address: Annotated[str, "Address inside the target segment"],
+    new_name: Annotated[str, "New name for the segment"],
+) -> str:
+    """Rename a segment"""
+    ea = parse_address(address)
+    seg = require_segment(ea)
+    if not ida_segment.set_segm_name(seg, new_name):
+        raise IDAError(f"Failed to rename segment containing {hex(ea)}")
+    return new_name
+
+@jsonrpc
+@idawrite
+def set_segment_comment(
+    address: Annotated[str, "Address inside the target segment"],
+    comment: Annotated[str, "Comment to apply to the segment"],
+    repeatable: Annotated[bool, "Set as repeatable comment"] = False,
+) -> str:
+    """Set the non-repeatable or repeatable segment comment"""
+    ea = parse_address(address)
+    seg = require_segment(ea)
+    if not ida_segment.set_segment_cmt(seg, comment, repeatable):
+        raise IDAError(f"Failed to set segment comment at {hex(ea)}")
+    return comment
+
+@jsonrpc
+@idawrite
+def set_segment_permissions(
+    address: Annotated[str, "Address inside the target segment"],
+    permissions: Annotated[str, "New permissions (e.g. rwx or 5)"]
+) -> str:
+    """Update the permission bits of a segment"""
+    ea = parse_address(address)
+    seg = require_segment(ea)
+    perm_value = parse_segment_permissions(permissions)
+    if not ida_segment.set_segm_attr(seg, ida_segment.SEGATTR_PERM, perm_value):
+        raise IDAError(f"Failed to set permissions for segment at {hex(ea)}")
+    return segment_perm_to_string(perm_value)
+
+@jsonrpc
+@idawrite
+def create_function(
+    start_address: Annotated[str, "Start address of the new function"],
+    end_address: Annotated[Optional[str], "Optional end address for the function (exclusive)"] = None,
+) -> Function:
+    """Create a function at the specified address"""
+    start = parse_address(start_address)
+    end = parse_address(end_address) if end_address else idaapi.BADADDR
+
+    if idaapi.get_func(start):
+        raise IDAError(f"A function already exists at {hex(start)}")
+    if end != idaapi.BADADDR and end <= start:
+        raise IDAError("Function end address must be greater than the start address")
+
+    if not ida_funcs.add_func(start, end):
+        raise IDAError(f"Failed to create function at {hex(start)}")
+
+    func = idaapi.get_func(start)
+    if func:
+        ida_auto.plan_range(func.start_ea, func.end_ea)
+        ida_auto.auto_wait()
+        return get_function(func.start_ea)
+    return get_function(start)
+
+@jsonrpc
+@idawrite
+def delete_function(
+    function_address: Annotated[str, "Address of the function to delete"],
+) -> str:
+    """Delete the function that starts at the given address"""
+    start = parse_address(function_address)
+    func = idaapi.get_func(start)
+    if not func:
+        raise IDAError(f"No function found at address {function_address}")
+    if not ida_funcs.del_func(func.start_ea):
+        raise IDAError(f"Failed to delete function at {hex(func.start_ea)}")
+    ida_auto.plan_range(func.start_ea, func.end_ea)
+    ida_auto.auto_wait()
+    return "success"
+
+@jsonrpc
+@idawrite
+def reanalyze_function(
+    function_address: Annotated[str, "Address of the function to reanalyze"],
+) -> str:
+    """Queue reanalysis for a function"""
+    start = parse_address(function_address)
+    func = idaapi.get_func(start)
+    if not func:
+        raise IDAError(f"No function found at address {function_address}")
+
+    try:
+        if not ida_funcs.reanalyze_function(func):
+            ida_auto.plan_range(func.start_ea, func.end_ea)
+    except AttributeError:
+        ida_auto.plan_range(func.start_ea, func.end_ea)
+    ida_auto.auto_wait()
+    return "success"
+
+@jsonrpc
+@idawrite
+def undefine_range(
+    address: Annotated[str, "Start address of the range to undefine"],
+    size: Annotated[int, "Number of bytes to undefine"],
+) -> str:
+    """Undefine the bytes in the specified range"""
+    if size <= 0:
+        raise IDAError("Size must be positive")
+    ea = parse_address(address)
+    ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, size)
+    ida_auto.plan_range(ea, ea + size)
+    ida_auto.auto_wait()
+    return f"Undefined {size} bytes at {hex(ea)}"
+
+DATA_TYPE_MAP: dict[str, tuple[int, int]] = {
+    "byte": (ida_bytes.FF_BYTE, 1),
+    "word": (ida_bytes.FF_WORD, 2),
+    "dword": (ida_bytes.FF_DWORD, 4),
+    "qword": (ida_bytes.FF_QWORD, 8),
+    "float": (ida_bytes.FF_FLOAT, 4),
+    "double": (ida_bytes.FF_DOUBLE, 8),
+}
+
+@jsonrpc
+@idawrite
+def create_data(
+    address: Annotated[str, "Address where data should be created"],
+    type_name: Annotated[str, "Data type to create (byte, word, dword, qword, float, double, ascii, unicode)"],
+    size: Annotated[Optional[int], "Size of the data (optional for fixed-size types)"] = None,
+) -> str:
+    """Create a typed data item at the specified address"""
+    ea = parse_address(address)
+    normalized_type = type_name.lower()
+
+    if normalized_type in ("ascii", "string", "str"):
+        if not size or size <= 0:
+            raise IDAError("Size must be provided for string literals")
+        ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, size)
+        if not ida_bytes.create_strlit(ea, size, ida_nalt.STRTYPE_C):
+            raise IDAError(f"Failed to create ASCII string at {hex(ea)}")
+        ida_auto.plan_range(ea, ea + size)
+        ida_auto.auto_wait()
+        return f"Created ASCII string at {hex(ea)}"
+
+    if normalized_type in ("unicode", "wstr", "utf16"):
+        if not size or size <= 0:
+            raise IDAError("Size must be provided for Unicode strings")
+        ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, size)
+        if not ida_bytes.create_strlit(ea, size, ida_nalt.STRTYPE_C_16):
+            raise IDAError(f"Failed to create Unicode string at {hex(ea)}")
+        ida_auto.plan_range(ea, ea + size)
+        ida_auto.auto_wait()
+        return f"Created Unicode string at {hex(ea)}"
+
+    if normalized_type not in DATA_TYPE_MAP:
+        raise IDAError(f"Unsupported data type: {type_name}")
+
+    flag, default_size = DATA_TYPE_MAP[normalized_type]
+    if size is None:
+        size = default_size
+    if size <= 0:
+        raise IDAError("Size must be positive")
+
+    ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, size)
+    if not ida_bytes.create_data(ea, flag, size, idaapi.BADNODE):
+        raise IDAError(f"Failed to create data item at {hex(ea)}")
+    ida_auto.plan_range(ea, ea + size)
+    ida_auto.auto_wait()
+    return f"Created {normalized_type} at {hex(ea)}"
+
+@jsonrpc
+@idawrite
+def create_instruction(
+    address: Annotated[str, "Address where an instruction should be created"],
+    reanalyze: Annotated[bool, "Queue auto-analysis after creating the instruction"] = True,
+) -> str:
+    """Force IDA to treat the bytes at the address as an instruction"""
+    ea = parse_address(address)
+    ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, 1)
+    if idaapi.create_insn(ea) == 0:
+        raise IDAError(f"Failed to create instruction at {hex(ea)}")
+    if reanalyze:
+        ida_auto.plan_ea(ea)
+        ida_auto.auto_wait()
+    return hex(ea)
+
+class ScriptExecutionResult(TypedDict):
+    stdout: str
+    stderr: NotRequired[str]
+    locals: NotRequired[dict[str, str]]
+
+def stringify_locals(local_vars: dict[str, Any]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for key, value in local_vars.items():
+        if key.startswith("__"):
+            continue
+        try:
+            result[key] = repr(value)
+        except Exception as e:
+            result[key] = f"<unrepresentable {type(value).__name__}: {e}>"
+    return result
+
+@jsonrpc
+@idawrite
+@unsafe
+def execute_python(
+    script: Annotated[str, "IDAPython statements to execute (DANGEROUS)"],
+    capture_output: Annotated[bool, "Capture stdout/stderr and return them"] = True,
+    return_locals: Annotated[bool, "Return locals produced by the script"] = False,
+) -> ScriptExecutionResult | str:
+    """Execute arbitrary IDAPython code inside the IDA process (unsafe)"""
+    local_vars: dict[str, Any] = {}
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+
+    try:
+        if capture_output:
+            with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+                exec(script, globals(), local_vars)
+        else:
+            exec(script, globals(), local_vars)
+    except Exception:
+        raise IDAError(f"Script execution failed:\n{traceback.format_exc()}")
+
+    if capture_output or return_locals:
+        result: ScriptExecutionResult = {
+            "stdout": stdout_buffer.getvalue() if capture_output else ""
+        }
+        if capture_output:
+            stderr_value = stderr_buffer.getvalue()
+            if stderr_value:
+                result["stderr"] = stderr_value
+        if return_locals:
+            result["locals"] = stringify_locals(local_vars)
+        return result
+
+    return "success"
+
+@jsonrpc
+@idawrite
+@unsafe
+def eval_python(
+    expression: Annotated[str, "Python expression to evaluate inside IDA (DANGEROUS)"],
+) -> str:
+    """Evaluate a Python expression in the IDA runtime and return its repr"""
+    try:
+        value = eval(expression, globals(), {})
+    except Exception:
+        raise IDAError(f"Expression evaluation failed:\n{traceback.format_exc()}")
+    try:
+        return repr(value)
+    except Exception as e:
+        return f"<unrepresentable result: {e}>"
+
+@jsonrpc
+@idawrite
+@unsafe
+def call_idc_function(
+    function_name: Annotated[str, "Name of the function in the idc module to invoke"],
+    arguments: Annotated[list, "Arguments to pass to the IDC function"],
+) -> Any:
+    """Call an IDC/IDAPython helper function by name"""
+    if not hasattr(idc, function_name):
+        raise IDAError(f"IDC function '{function_name}' not found")
+    func = getattr(idc, function_name)
+    if not callable(func):
+        raise IDAError(f"IDC object '{function_name}' is not callable")
+
+    try:
+        result = func(*arguments)
+    except Exception:
+        raise IDAError(f"IDC function '{function_name}' raised an exception:\n{traceback.format_exc()}")
+
+    try:
+        json.dumps(result)
+        return result
+    except TypeError:
+        return repr(result)
+
+@jsonrpc
+@idawrite
+@unsafe
+def process_ui_action(
+    action_name: Annotated[str, "Identifier of the UI action to trigger"],
+    flags: Annotated[int, "UI action flags (use 0 for defaults)"] = 0,
+) -> str:
+    """Trigger an IDA UI action"""
+    if not ida_kernwin.process_ui_action(action_name, flags):
+        raise IDAError(f"Failed to execute UI action '{action_name}'")
+    return "success"
 
 class RegisterValue(TypedDict):
     name: str
