@@ -58,6 +58,16 @@ the type of a stack variable.
 - `data_read_dword(address)`: Read the 4 byte value at the specified address as a DWORD.
 - `data_read_qword(address)`: Read the 8 byte value at the specified address as a QWORD.
 - `data_read_string(address)`: Read the string at the specified address.
+- `list_segments()`: List all segments in the database with metadata.
+- `set_segment_name(address, new_name)`: Rename a segment.
+- `set_segment_comment(address, comment, repeatable)`: Set (non-)repeatable comments on a segment.
+- `set_segment_permissions(address, permissions)`: Update the permissions of a segment.
+- `create_function(start_address, end_address)`: Create a function at the specified address.
+- `delete_function(function_address)`: Delete the function at the specified address.
+- `reanalyze_function(function_address)`: Queue reanalysis for a function.
+- `undefine_range(address, size)`: Undefine bytes in the given address range.
+- `create_data(address, type_name, size)`: Create typed data (byte/word/dword/qword/float/double/string) at an address.
+- `create_instruction(address, reanalyze)`: Force IDA to treat bytes at an address as an instruction.
 
 Unsafe functions (`--unsafe` flag required):
 
@@ -73,6 +83,10 @@ Unsafe functions (`--unsafe` flag required):
 - `dbg_step_over()`: Step over the current instruction.
 - `dbg_delete_breakpoint(address)`: Delete a breakpoint at the specified address.
 - `dbg_enable_breakpoint(address, enable)`: Enable or disable a breakpoint at the specified address.
+- `execute_python(script, capture_output, return_locals)`: Execute arbitrary IDAPython code inside IDA.
+- `eval_python(expression)`: Evaluate a Python expression in the IDA runtime.
+- `call_idc_function(function_name, arguments)`: Call an IDC/IDAPython helper by name.
+- `process_ui_action(action_name, flags)`: Trigger an IDA UI action.
 
 ## Prerequisites
 
@@ -90,11 +104,17 @@ Unsafe functions (`--unsafe` flag required):
 
 ## Installation
 
-Install the latest version of the IDA Pro MCP package:
+Install the latest version of the IDA Pro MCP package from PyPI:
 
 ```sh
-pip uninstall ida-pro-mcp
-pip install https://github.com/mrexodia/ida-pro-mcp/archive/refs/heads/main.zip
+pip uninstall -y ida-pro-mcp
+pip install ida-pro-mcp
+```
+
+Alternatively, using uv:
+
+```sh
+uv pip install ida-pro-mcp
 ```
 
 Configure the MCP servers and install the IDA Plugin:
